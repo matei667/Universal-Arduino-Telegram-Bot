@@ -435,11 +435,62 @@ int UniversalTelegramBot::getUpdates(long offset) {
   }
 }
 
+// Helper to manually extract a value (numeric or otherwise) as a String from JSON when parsing fails
+// Use this for IDs which are numbers in JSON but we want as Strings (to avoid overflow)
+String extractRawValueFromJSONForPoison(const String& json, const String& key) {
+  int keyIndex = json.indexOf(key);
+  if (keyIndex == -1) return "";
+  
+  int startValue = keyIndex + key.length(); 
+  
+  // Find the end of the value (comma or closing brace)
+  int endValueComma = json.indexOf(',', startValue);
+  int endValueBrace = json.indexOf('}', startValue);
+  
+  int endValue = -1;
+  if (endValueComma != -1 && endValueBrace != -1) {
+    endValue = min(endValueComma, endValueBrace);
+  } else if (endValueComma != -1) {
+    endValue = endValueComma;
+  } else {
+    endValue = endValueBrace;
+  }
+  
+  if (endValue != -1) {
+    return json.substring(startValue, endValue);
+  }
+  return "";
+}
+
+// Helper to manually extract a long value from a JSON string when parsing fails
+long extractLongFromJSONForPoison(const String& json, const String& key) {
+  String val = extractRawValueFromJSONForPoison(json, key);
+  if (val.length() > 0) return val.toInt();
+  return 0;
+}
+
+// Helper to extract a string value (handles quotes)
+String extractStringFromJSONForPoison(const String& json, const String& key) {
+  int keyIndex = json.indexOf(key);
+  if (keyIndex == -1) return "";
+  
+  // key e.g. "\"first_name\":\""
+  int startValue = keyIndex + key.length();
+  
+  // Find the closing quote
+  int endValue = json.indexOf('"', startValue);
+  
+  if (endValue != -1) {
+    return json.substring(startValue, endValue);
+  }
+  return "";
+}
+
 int UniversalTelegramBot::getUpdatesPoisonDrop(long offset) {
 
   // 1. Prepare Request
   #ifdef TELEGRAM_DEBUG  
-    Serial.println(F("GET Update Messages"));
+    Serial.println(F("GET Update Messages (Poison Drop Mode)"));
   #endif
   String command = BOT_CMD("getUpdates?offset=");
   command += offset;
@@ -453,9 +504,11 @@ int UniversalTelegramBot::getUpdatesPoisonDrop(long offset) {
   
   String response = sendGetToTelegram(command); 
 
+  // Reset the dropped state at the start of each call
+  lastDroppedUpdate = {false, 0, "", "", ""};
+
   if (response == "") {
     closeClient();
-    getUpdatesPoisonDropped = false; // "" it's not considered poison
     return 0;
   } else {
     // Attempt Normal Parsing
@@ -472,7 +525,6 @@ int UniversalTelegramBot::getUpdatesPoisonDrop(long offset) {
             JsonObject result = doc["result"][i];
             if (processResult(result, newMessageIndex)) newMessageIndex++;
           }
-          getUpdatesPoisonDropped = false;
           return newMessageIndex;
         }
       }
@@ -483,43 +535,58 @@ int UniversalTelegramBot::getUpdatesPoisonDrop(long offset) {
       #ifdef TELEGRAM_DEBUG 
           Serial.print(F("JSON Parse Failed: "));
           Serial.println(error.c_str()); 
+          Serial.println(F("Attempting manual extraction of dropped message info..."));
       #endif      
       
-      // The JSON crashed, but the "update_id" is always at the very start of the text.
-      // We manually search for the text: "update_id":
-      
-      int labelIndex = response.indexOf("\"update_id\":");
-      
-      if (labelIndex != -1) {
-        // We found the start! Now look for the comma "," that comes after the number
-        int startNum = labelIndex + 12; // Skip the 12 characters of: "update_id":
-        int endNum = response.indexOf(",", startNum); 
-        
-        if (endNum != -1) {
-          // Cut out the number string between the label and the comma
-          String realIDString = response.substring(startNum, endNum);
-          
-          // Convert it to a long integer
-          long realID = realIDString.toInt();
-          
-          #ifdef TELEGRAM_DEBUG
-            Serial.print(F("!!! MANUAL SKIP: Found Update ID: "));
-            Serial.println(realID);
-          #endif
+      // Initialize the dropped update struct with default/neutral values
+      lastDroppedUpdate.active = true;
+      lastDroppedUpdate.update_id = 0;
+      lastDroppedUpdate.from_id = "";
+      lastDroppedUpdate.from_name = "";
+      lastDroppedUpdate.chat_id = "";
 
-          // Force the internal counter to this ID
-          // Next loop will request (realID + 1), which deletes this message.
-          this->last_message_received = realID;
-          getUpdatesPoisonDropped = true;
-          
-        } else {
-           // Fallback: If we can't find a comma, we just use the old offset
-           this->last_message_received = offset; 
-        }
-      } else {
-         // Fallback: If we can't find "update_id" at all
-         this->last_message_received = offset;
+      // 1. Extract Update ID (Critical for skipping)
+      // "update_id":123456
+      lastDroppedUpdate.update_id = extractLongFromJSONForPoison(response, "\"update_id\":");
+      
+      // Fallback if update_id extraction failed
+      if (lastDroppedUpdate.update_id == 0) {
+         #ifdef TELEGRAM_DEBUG
+           Serial.println(F("Could not extract update_id, using offset as fallback"));
+         #endif
+         lastDroppedUpdate.update_id = offset;
       }
+
+      // 2. Extract Chat ID
+      // Structure could be "chat":{"id":12345 or "chat": { "id": 12345
+      // extracted as String to preserve precision
+      String chatId = extractRawValueFromJSONForPoison(response, "\"chat\":{\"id\":");
+      if (chatId == "") chatId = extractRawValueFromJSONForPoison(response, "\"chat\":{\"id\": "); // spaced
+      lastDroppedUpdate.chat_id = chatId;
+
+      // 3. Extract From ID (User ID)
+      // "from":{"id":12345
+      String fromId = extractRawValueFromJSONForPoison(response, "\"from\":{\"id\":");
+      lastDroppedUpdate.from_id = fromId;
+
+      // 4. Extract First Name
+      // "from":{..."first_name":"Matei"
+      // This is harder because it might be separate from 'from'. 
+      // We look for "first_name":"
+      lastDroppedUpdate.from_name = extractStringFromJSONForPoison(response, "\"first_name\":\"");
+      
+      #ifdef TELEGRAM_DEBUG
+        Serial.println(F("--- Dropped Message Info ---"));
+        Serial.print(F("Update ID: ")); Serial.println(lastDroppedUpdate.update_id);
+        Serial.print(F("Chat ID: ")); Serial.println(lastDroppedUpdate.chat_id);
+        Serial.print(F("From ID: ")); Serial.println(lastDroppedUpdate.from_id);
+        Serial.print(F("Name: ")); Serial.println(lastDroppedUpdate.from_name);
+        Serial.println(F("----------------------------"));
+      #endif
+
+      // Advance the offset to skip this poison message
+      // If we found a real ID, skip it (next call should use realID + 1)
+      this->last_message_received = lastDroppedUpdate.update_id;
     }
     
     closeClient();
@@ -528,7 +595,11 @@ int UniversalTelegramBot::getUpdatesPoisonDrop(long offset) {
 }
 
 bool UniversalTelegramBot::didGetUpdatesDropPoison() {
-  return getUpdatesPoisonDropped;
+  return lastDroppedUpdate.active;
+}
+
+DroppedUpdate UniversalTelegramBot::getLastDroppedUpdate() {
+  return lastDroppedUpdate;
 }
 
 bool UniversalTelegramBot::processResult(JsonObject result, int messageIndex) {

@@ -65,6 +65,14 @@ struct telegramMessage {
   String query_id;
 };
 
+struct DroppedUpdate {
+  bool active;
+  long update_id;
+  String from_id;
+  String from_name;
+  String chat_id;
+};
+
 class UniversalTelegramBot {
 public:
   UniversalTelegramBot(const String& token, Client &client);
@@ -120,6 +128,8 @@ public:
   int getUpdatesPoisonDrop(long offset);
   // Return true if the last getUpdatesPoisonDrop call dropped the poison drop
   bool didGetUpdatesDropPoison();
+  DroppedUpdate getLastDroppedUpdate();
+
   bool checkForOkResponse(const String& response);
   telegramMessage messages[HANDLE_MESSAGES];
   long last_message_received;
@@ -133,7 +143,7 @@ public:
 
 private:
   // State of the last getUpdatesPoisonDrop call
-  bool getUpdatesPoisonDropped = false;
+  DroppedUpdate lastDroppedUpdate = {false, 0, "", "", ""};
   // JsonObject * parseUpdates(String response);
   String _token;
   Client *client;
