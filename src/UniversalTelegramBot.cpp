@@ -435,6 +435,102 @@ int UniversalTelegramBot::getUpdates(long offset) {
   }
 }
 
+int UniversalTelegramBot::getUpdatesPoisonDrop(long offset) {
+
+  // 1. Prepare Request
+  #ifdef TELEGRAM_DEBUG  
+    Serial.println(F("GET Update Messages"));
+  #endif
+  String command = BOT_CMD("getUpdates?offset=");
+  command += offset;
+  command += F("&limit=");
+  command += HANDLE_MESSAGES;
+  
+  if (longPoll > 0) {
+    command += F("&timeout=");
+    command += String(longPoll);
+  }
+  
+  String response = sendGetToTelegram(command); 
+
+  if (response == "") {
+    closeClient();
+    getUpdatesPoisonDropped = false; // "" it's not considered poison
+    return 0;
+  } else {
+    // Attempt Normal Parsing
+    DynamicJsonDocument doc(maxMessageLength);
+    DeserializationError error = deserializeJson(doc, ZERO_COPY(response));
+      
+    if (!error) {
+      // --- SUCCESS BLOCK (Normal Messages) ---
+      if (doc.containsKey("result")) {
+        int resultArrayLength = doc["result"].size();
+        if (resultArrayLength > 0) {
+          int newMessageIndex = 0;
+          for (int i = 0; i < resultArrayLength; i++) {
+            JsonObject result = doc["result"][i];
+            if (processResult(result, newMessageIndex)) newMessageIndex++;
+          }
+          getUpdatesPoisonDropped = false;
+          return newMessageIndex;
+        }
+      }
+      return 0;
+    } else { 
+      // --- FAILURE BLOCK (Poison Message Handling) ---
+      
+      #ifdef TELEGRAM_DEBUG 
+          Serial.print(F("JSON Parse Failed: "));
+          Serial.println(error.c_str()); 
+      #endif      
+      
+      // The JSON crashed, but the "update_id" is always at the very start of the text.
+      // We manually search for the text: "update_id":
+      
+      int labelIndex = response.indexOf("\"update_id\":");
+      
+      if (labelIndex != -1) {
+        // We found the start! Now look for the comma "," that comes after the number
+        int startNum = labelIndex + 12; // Skip the 12 characters of: "update_id":
+        int endNum = response.indexOf(",", startNum); 
+        
+        if (endNum != -1) {
+          // Cut out the number string between the label and the comma
+          String realIDString = response.substring(startNum, endNum);
+          
+          // Convert it to a long integer
+          long realID = realIDString.toInt();
+          
+          #ifdef TELEGRAM_DEBUG
+            Serial.print(F("!!! MANUAL SKIP: Found Update ID: "));
+            Serial.println(realID);
+          #endif
+
+          // Force the internal counter to this ID
+          // Next loop will request (realID + 1), which deletes this message.
+          this->last_message_received = realID;
+          getUpdatesPoisonDropped = true;
+          
+        } else {
+           // Fallback: If we can't find a comma, we just use the old offset
+           this->last_message_received = offset; 
+        }
+      } else {
+         // Fallback: If we can't find "update_id" at all
+         this->last_message_received = offset;
+      }
+    }
+    
+    closeClient();
+    return 0;
+  }
+}
+
+bool UniversalTelegramBot::didGetUpdatesDropPoison() {
+  return getUpdatesPoisonDropped;
+}
+
 bool UniversalTelegramBot::processResult(JsonObject result, int messageIndex) {
   long update_id = result["update_id"];
   // Check have we already dealt with this message (this shouldn't happen!)

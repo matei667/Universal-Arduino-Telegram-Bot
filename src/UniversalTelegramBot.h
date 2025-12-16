@@ -117,6 +117,9 @@ public:
   String buildCommand(const String& cmd);
 
   int getUpdates(long offset);
+  int getUpdatesPoisonDrop(long offset);
+  // Return true if the last getUpdatesPoisonDrop call dropped the poison drop
+  bool didGetUpdatesDropPoison();
   bool checkForOkResponse(const String& response);
   telegramMessage messages[HANDLE_MESSAGES];
   long last_message_received;
@@ -129,6 +132,8 @@ public:
   int maxMessageLength = 1500;
 
 private:
+  // State of the last getUpdatesPoisonDrop call
+  bool getUpdatesPoisonDropped = false;
   // JsonObject * parseUpdates(String response);
   String _token;
   Client *client;
